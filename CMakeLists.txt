@@ -60,7 +60,8 @@ set(SOURCE_FILES
         lib/private_lib/b64/encode.h
         lib/private_lib/b64/cdecode.c
         lib/private_lib/b64/cencode.c
-        src/main.cpp)
+        src/main.cpp
+        src/json2msgpack.cpp)
 
 include_directories(lib/private_lib/)
 
