@@ -30,3 +30,15 @@
 *.exe
 *.out
 *.app
+
+.pioenvs
+.piolibdeps
+.idea
+msgpack_mqtt_cli
+.pioenvs
+.piolibdeps
+CMakeCache.txt
+CMakeFiles/
+cmake-build-debug
+cmake_install.cmake
+Makefile
