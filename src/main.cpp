@@ -21,6 +21,7 @@ using namespace rapidjson;
 
 typedef struct options_t {
     const char* command;
+    const char* runcmd;
     const char* out_filename;
     const char* in_filename;
     bool lax;
@@ -36,8 +37,12 @@ typedef struct options_t {
 
 // from json2msgpack.cpp
 bool write_value(options_t* options, Value& value, mpack_writer_t* writer);
+// from msgpack2json.cpp
+template <class WriterType>
+static bool element(mpack_reader_t* reader, WriterType& writer, bool b_base64, bool b_base64_prefix, bool b_debug);
 
-static int transform(options_t *options, Document &document, char *p_buf, size_t sz_buf) {
+
+static int convert_json_to_msgpack(options_t *options, Document &document, char *p_buf, size_t sz_buf) {
     mpack_writer_t writer;
     mpack_writer_init(&writer, p_buf, sz_buf);
 
@@ -122,13 +127,9 @@ static bool load_file_or_stdin(options_t *options, char **out_data, size_t *out_
     return true;
 }
 
-void connect_callback(struct mosquitto *mosq, void *obj, int result)
+void mqtt_connect_callback(struct mosquitto *mosq, void *obj, int result)
 {
 	printf("connect callback, rc=%d\n", result);
-}
-
-void message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_message *message)
-{
 }
 
 int mqtt_publish(options_t *options, char *p_buf, size_t sz_buf)
@@ -140,13 +141,12 @@ int mqtt_publish(options_t *options, char *p_buf, size_t sz_buf)
 
 	mosquitto_lib_init();
 
-	memset(clientid, 0, 24);
-	snprintf(clientid, 23, "msgpack-mqtt-cli/%d", getpid());
+	memset(clientid, 0, sizeof(clientid));
+	snprintf(clientid, sizeof(clientid)-1, "msgpack-mqtt-cli/%d", getpid());
 	mosq = mosquitto_new(clientid, true, 0);
 
 	if(mosq){
-		mosquitto_connect_callback_set(mosq, connect_callback);
-		mosquitto_message_callback_set(mosq, message_callback);
+    mosquitto_connect_callback_set(mosq, mqtt_connect_callback);
 
     if ( options->debug) {
       fprintf(stderr, "Connecting MQTT\n");
@@ -176,14 +176,72 @@ int mqtt_publish(options_t *options, char *p_buf, size_t sz_buf)
 	return rc;
 }
 
+void mqtt_message_callback(struct mosquitto *mosq, void *obj, const struct mosquitto_message *message)
+{
+  options_t *options = (options_t*)obj;
+
+  if ( options->debug) {
+    fprintf(stderr, "Received message (mid=%i, len=%i)\n",
+            message->mid,
+            message->payloadlen
+    );
+  }
+  // convert to msgpack
+
+}
+
+int mqtt_subscribe(options_t *options)
+{
+  uint8_t reconnect = true;
+  char clientid[24];
+  struct mosquitto *mosq;
+  int rc = 0;
+
+  mosquitto_lib_init();
+
+  memset(clientid, 0, sizeof(clientid));
+  snprintf(clientid, sizeof(clientid)-1, "msgpack-mqtt-cli/%d", getpid());
+  mosq = mosquitto_new(clientid, true, options);
+
+  if(mosq){
+    mosquitto_connect_callback_set(mosq, mqtt_connect_callback);
+    mosquitto_message_callback_set(mosq, mqtt_message_callback);
+
+    if ( options->debug) {
+      fprintf(stderr, "Connecting MQTT\n");
+    }
+    rc = mosquitto_connect(mosq, options->mqtt_server_host, options->mqtt_server_port, 5);
+    if ( rc != 0) {
+      fprintf(stderr, "ERROR connecting to MQTT server at %s:%i\n", options->mqtt_server_host, options->mqtt_server_port);
+    }
+
+    if ( options->debug) {
+      fprintf(stderr, "Connected, subscribing to topic %s\n", options->mqtt_topic);
+    }
+    rc = mosquitto_subscribe(mosq, NULL, options->mqtt_topic, 1);
+    if ( rc != 0) {
+      fprintf(stderr, "ERROR subscribing to topic %s\n", options->mqtt_topic);
+    }
+    // TODO: timeout via options_t
+    rc = mosquitto_loop_forever(mosq, -1, 1);
+    mosquitto_destroy(mosq);
+  } else {
+    fprintf(stderr, "Error creating mqtt client.\n");
+  }
+
+  mosquitto_lib_cleanup();
+
+  return rc;
+}
 
 
-static bool process(options_t *options) {
+
+static bool process_pub(options_t *options) {
     char* data = NULL;
     size_t size = 0;
 
     if ( options->debug) {
-      fprintf(stderr, "Reading input...\n");
+      fprintf(stderr, "PUB: Reading input...\n");
     }
 
     if (!load_file_or_stdin(options, &data, &size))
@@ -191,7 +249,7 @@ static bool process(options_t *options) {
 
     // The data has been null-terminated by load_file()
     if ( options->debug) {
-      fprintf(stderr, "Converting JSON to Msgpack\n");
+      fprintf(stderr, "PUB Converting JSON to Msgpack\n");
     }
 
     Document document;
@@ -201,23 +259,39 @@ static bool process(options_t *options) {
         document.ParseInsitu<kParseFullPrecisionFlag>(data);
 
     if (document.HasParseError()) {
-        fprintf(stderr, "%s: error parsing JSON at offset %i:\n    %s\n", options->command,
+        fprintf(stderr, "PUB: %s: error parsing JSON at offset %i:\n    %s\n", options->command,
                 (int)document.GetErrorOffset(), GetParseError_En(document.GetParseError()));
         free(data);
         return false;
     }
 
     char buf[1024];
-    int len = transform(options, document, buf,sizeof(buf));
+    int len = convert_json_to_msgpack(options, document, buf, sizeof(buf));
     if ( len >= 0) {
       if ( options->debug) {
-        fprintf(stderr, "Publishing on topic %s\n", options->mqtt_topic);
+        fprintf(stderr, "PUB: Publishing on topic %s\n", options->mqtt_topic);
       }
       mqtt_publish(options, buf, len);
     }
     free(data);
     return true;
 }
+
+static bool process_sub(options_t *options) {
+  mqtt_subscribe(options);
+  return false;
+}
+
+static bool process(options_t *options) {
+  if (strcmp("pub", options->runcmd) == 0) {
+    return process_pub(options);
+  }
+  if (strcmp("sub", options->runcmd) == 0) {
+    return process_sub(options);
+  }
+  return false;
+}
+
 
 static void parse_min_bytes(options_t* options) {
     const char* arg = optarg;
@@ -236,13 +310,17 @@ static void parse_min_bytes(options_t* options) {
 }
 
 static void usage(const char* command) {
-    fprintf(stderr, "Usage: %s [-s <host|ip>] [-p <port>] [-t <topic>] [-i <infile>] [-o <outfile>] [-lfb] [-B <min>] [-d]\n", command);
+    fprintf(stderr, "Usage: %s COMMAND [-s <host|ip>] [-p <port>] [-t <topic>] [-i <infile>] [-o <outfile>] [-lfb] [-B <min>] [-d]\n", command);
+    fprintf(stderr, "where:\n");
+    fprintf(stderr, "COMMAND is one of\n");
+    fprintf(stderr, "    pub           read from stdin or file, convert to msgpack, publish to topic\n");
+    fprintf(stderr, "    sub           subscribe to topic, read and convert from msgpack to json, write to stdout or file\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "    -s <host|ip>  Hostname or IP of MQTT server (default localhost)\n");
-    fprintf(stderr, "    -p <port>     Port of MQTT server (default 1883)\n");
-    fprintf(stderr, "    -t <topic>    Name of topic to publish on (default slyft)\n");
-    fprintf(stderr, "    -i <infile>  Input filename (default stdin)\n");
-    fprintf(stderr, "    -o <outfile>  Output filename (default stdout)\n");
+    fprintf(stderr, "    -s <host|ip>  Hostname or IP of MQTT server (default: localhost)\n");
+    fprintf(stderr, "    -p <port>     Port of MQTT server (default: 1883)\n");
+    fprintf(stderr, "    -t <topic>    Name of topic to publish on (default: slyft)\n");
+    fprintf(stderr, "    -i <infile>   Input filename (default: stdin)\n");
+    fprintf(stderr, "    -o <outfile>  Output filename (default: stdout)\n");
     fprintf(stderr, "    -l  Lax mode, allows comments and trailing commas\n");
     fprintf(stderr, "    -f  Write floats instead of doubles\n");
     fprintf(stderr, "    -b  Convert base64 strings with \"base64:\" prefix to bin\n");
@@ -256,16 +334,37 @@ static void usage(const char* command) {
 #define OPTIONS_DEFAULT_MQTT_TOPIC        "slyft"
 
 int main(int argc, char** argv) {
+    // clear and set default options
     options_t options;
     memset(&options, 0, sizeof(options));
+
+    // check for command
     options.command = argv[0];
+    if ( argc < 2) {
+      usage(options.command);
+      exit(1);
+    }
+    options.runcmd = argv[1];
+
+    if (
+            (strcmp("pub", options.runcmd) != 0) &&
+            (strcmp("sub", options.runcmd) != 0)
+            ) {
+      fprintf(stderr, "command %s not valid, see usage\n", options.runcmd);
+      exit(1);
+    }
+
+    argv++;
+    argc--;
+
     options.mqtt_server_host = OPTIONS_DEFAULT_MQTT_SERVER_HOST;
     options.mqtt_server_port = OPTIONS_DEFAULT_MQTT_SERVER_PORT;
     options.mqtt_topic = OPTIONS_DEFAULT_MQTT_TOPIC;
 
+    // parse options
     opterr = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "h:p:i:o:lfbdB:hv?")) != -1) {
+    while ((opt = getopt(argc, argv, "s:t:p:i:o:lfbdB:hv?")) != -1) {
         switch (opt) {
             case 's':
                 options.mqtt_server_host = optarg;
