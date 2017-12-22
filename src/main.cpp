@@ -1,18 +1,22 @@
 /*
  * The MIT License (MIT)
  *
- * Bases on msgpack-tools/json2msgpack, copyright (c) 2015-2017 Nicholas Fraser
+ * Based on msgpack-tools/json2msgpack, copyright (c) 2015-2017 Nicholas Fraser
  */
 
 
 #include <stdio.h>
 #include <unistd.h>
+#include <iostream>
 
 
 #include <errno.h>
+#include <rapidjson/filewritestream.h>
+#include <rapidjson/prettywriter.h>
 #include "rapidjson/rapidjson.h"
 #include "rapidjson/document.h"
 #include "rapidjson/error/en.h"
+#include "rapidjson/writer.h"
 #include "mpack/mpack.h"
 
 #include "mosquitto/mosquitto.h"
@@ -33,14 +37,204 @@ typedef struct options_t {
     int mqtt_server_port;
     const char* mqtt_topic;
     bool debug;
+    bool pretty;
 } options_t;
 
 // from json2msgpack.cpp
 bool write_value(options_t* options, Value& value, mpack_writer_t* writer);
-// from msgpack2json.cpp
-template <class WriterType>
-static bool element(mpack_reader_t* reader, WriterType& writer, bool b_base64, bool b_base64_prefix, bool b_debug);
 
+// libb64 doesn't have extern "C" around its C headers
+extern "C" {
+#include "b64/cdecode.h"
+#include "b64/cencode.h"
+}
+
+#define BUFFER_SIZE 65536
+
+using namespace rapidjson;
+
+typedef enum continuous_mode_t {
+  continuous_off = 0,
+  continuous_undelimited,
+  continuous_commas,
+} continuous_mode_t;
+
+
+// Reads MessagePack string bytes and outputs a JSON string
+template <class WriterType>
+static bool string(mpack_reader_t* reader, WriterType& writer, uint32_t len) {
+  if (mpack_should_read_bytes_inplace(reader, len)) {
+    const char* str = mpack_read_bytes_inplace(reader, len);
+    if (mpack_reader_error(reader) != mpack_ok) {
+      fprintf(stderr, "error reading string bytes\n");
+      return false;
+    }
+    bool ok = writer.String(str, len);
+    mpack_done_str(reader);
+    return ok;
+  }
+
+  char* str = (char*)malloc(len);
+  mpack_read_bytes(reader, str, len);
+  if (mpack_reader_error(reader) != mpack_ok) {
+    fprintf(stderr, "error reading string bytes\n");
+    free(str);
+    return false;
+  }
+  mpack_done_str(reader);
+
+  bool ok = writer.String(str, len);
+  free(str);
+  return ok;
+}
+
+static const char* ext_str = "ext:";
+static const char* b64_str = "base64:";
+
+static uint32_t base64_len(uint32_t len) {
+  return ((len + 3) * 4) / 3; // TODO check this
+}
+
+// Converts MessagePack bin/ext bytes to JSON base64 string
+template <class WriterType>
+static bool base64(mpack_reader_t* reader, WriterType& writer, uint32_t len, char* output, char* p, bool prefix) {
+  if (prefix) {
+    memcpy(p, b64_str, strlen(b64_str));
+    p += strlen(b64_str);
+  }
+
+  base64_encodestate state;
+  base64_init_encodestate(&state);
+
+  while (len > 0) {
+    char buf[4096];
+    uint32_t count = (len < sizeof(buf)) ? len : sizeof(buf);
+    len -= count;
+    mpack_read_bytes(reader, buf, count);
+    if (mpack_reader_error(reader) != mpack_ok) {
+      fprintf(stderr, "error reading base64 bytes\n");
+      return false;
+    }
+    p += base64_encode_block(buf, (int)count, p, &state);
+  }
+  p += base64_encode_blockend(p, &state);
+
+  return writer.String(output, p - output);
+}
+
+// Reads MessagePack bin bytes and outputs a JSON base64 string
+template <class WriterType>
+static bool base64_bin(mpack_reader_t* reader, WriterType& writer, uint32_t len, bool prefix) {
+  uint32_t new_len = base64_len(len) + (prefix ? strlen(b64_str) : 0);
+  char* output = (char*)malloc(new_len);
+
+  bool ret = base64(reader, writer, len, output, output, prefix);
+
+  mpack_done_bin(reader);
+  free(output);
+  return ret;
+}
+
+// Reads MessagePack ext bytes and outputs a JSON base64 string
+template <class WriterType>
+static bool base64_ext(mpack_reader_t* reader, WriterType& writer, int8_t exttype, uint32_t len) {
+  uint32_t new_len = base64_len(len) + strlen(ext_str) + 5 + strlen(b64_str);
+  char* output = (char*)malloc(new_len);
+
+  char* p = output;
+  strcpy(p, ext_str);
+  p += strlen(ext_str);
+  sprintf(p, "%i", exttype);
+  p += strlen(p);
+  *p++ = ':';
+
+  bool ret = base64(reader, writer, len, output, p, true);
+
+  mpack_done_ext(reader);
+  free(output);
+  return ret;
+}
+
+template <class WriterType>
+bool element(mpack_reader_t* reader, WriterType& writer, bool b_base64, bool b_base64_prefix, bool b_debug) {
+  const mpack_tag_t tag = mpack_read_tag(reader);
+  if (mpack_reader_error(reader) != mpack_ok)
+    return false;
+
+  switch (tag.type) {
+    case mpack_type_bool:   return writer.Bool(tag.v.b);
+    case mpack_type_nil:    return writer.Null();
+    case mpack_type_int:    return writer.Int64(tag.v.i);
+    case mpack_type_uint:   return writer.Uint64(tag.v.u);
+    case mpack_type_float:  return writer.Double((double)tag.v.f);
+    case mpack_type_double: return writer.Double(tag.v.d);
+
+    case mpack_type_str:
+      return string(reader, writer, tag.v.l);
+
+    case mpack_type_bin:
+      if (b_base64) {
+        return base64_bin(reader, writer, tag.v.l, b_base64_prefix);
+      } else if (b_debug) {
+        mpack_skip_bytes(reader, tag.v.l);
+        mpack_done_bin(reader);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "<bin of size %u>", tag.v.l);
+        return writer.RawValue(buf, strlen(buf), kStringType);
+      } else {
+        fprintf(stderr, "bin unencodable in JSON. Try debug viewing mode (-d)\n");
+        return false;
+      }
+
+    case mpack_type_ext:
+      if (b_base64) {
+        return base64_ext(reader, writer, tag.exttype, tag.v.l);
+      } else if (b_debug) {
+        mpack_skip_bytes(reader, tag.v.l);
+        mpack_done_ext(reader);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "<ext of type %i size %u>", tag.exttype, tag.v.l);
+        return writer.RawValue(buf, strlen(buf), kStringType);
+      } else {
+        fprintf(stderr, "ext type %i unencodable in JSON. Try debug viewing mode (-d)\n", tag.exttype);
+        return false;
+      }
+
+    case mpack_type_array:
+      if (!writer.StartArray())
+        return false;
+      for (size_t i = 0; i < tag.v.l; ++i)
+        if (!element(reader, writer, b_base64, b_base64_prefix, b_debug))
+          return false;
+      mpack_done_array(reader);
+      return writer.EndArray();
+
+    case mpack_type_map:
+      if (!writer.StartObject())
+        return false;
+      for (size_t i = 0; i < tag.v.l; ++i) {
+
+        if (b_debug) {
+          element(reader, writer, b_base64, b_base64_prefix, b_debug);
+        } else {
+          uint32_t len = mpack_expect_str(reader);
+          if (mpack_reader_error(reader) != mpack_ok) {
+            fprintf(stderr, "map key is not a string. Try debug viewing mode (-d)\n");
+            return false;
+          }
+          if (!string(reader, writer, len))
+            return false;
+        }
+
+        if (!element(reader, writer, b_base64, b_base64_prefix, b_debug))
+          return false;
+      }
+      mpack_done_map(reader);
+      return writer.EndObject();
+  }
+
+  return true;
+}
 
 static int convert_json_to_msgpack(options_t *options, Document &document, char *p_buf, size_t sz_buf) {
     mpack_writer_t writer;
@@ -56,6 +250,59 @@ static int convert_json_to_msgpack(options_t *options, Document &document, char 
         return -1;
     }
     return len;
+}
+
+static int convert_msgpack_to_json(options_t *options, char *p_input_buf, size_t sz_input_buf) {
+  mpack_reader_t reader;
+  mpack_reader_init(&reader, p_input_buf, sz_input_buf, sz_input_buf);
+
+  //printf("convert_msgpack_to_json: %s\n", p_input_buf);
+
+  FILE* out_file;
+  if (options->out_filename) {
+    out_file = fopen(options->out_filename, "wb");
+    if (out_file == NULL) {
+      fprintf(stderr, "%s: could not open \"%s\" for writing.\n", options->command, options->in_filename);
+      return false;
+    }
+  } else {
+    out_file = stdout;
+  }
+  char* buffer = (char*)calloc(BUFFER_SIZE, 1);
+  FileWriteStream stream(out_file, buffer, BUFFER_SIZE);
+
+  bool ret = true;
+  if (options->pretty) {
+    PrettyWriter<FileWriteStream> writer(stream);
+    // Convert an element
+    if (!element(&reader, writer, true, true, options->debug)) {
+      ret = false;
+    }
+
+    // RapidJSON's PrettyWriter does not add a final
+    // newline at the end of the JSON
+    stream.Put('\n');
+    stream.Flush();
+
+  } else {
+    Writer<FileWriteStream> writer(stream);
+    // Convert an element
+    if (!element(&reader, writer, true, true, options->debug)) {
+      ret = false;
+    }
+    stream.Flush();
+  }
+
+  free(buffer);
+  mpack_error_t error = mpack_reader_destroy(&reader);
+  if ( out_file != stdout) {
+    fclose(out_file);
+  }
+
+  if (!ret)
+    fprintf(stderr, "%s: parse error: %s (%i)\n", options->command,
+            mpack_error_to_string(error), (int)error);
+  return ret;
 }
 
 static bool load_file_or_stdin(options_t *options, char **out_data, size_t *out_size) {
@@ -127,9 +374,12 @@ static bool load_file_or_stdin(options_t *options, char **out_data, size_t *out_
     return true;
 }
 
-void mqtt_connect_callback(struct mosquitto *mosq, void *obj, int result)
-{
-	printf("connect callback, rc=%d\n", result);
+void mqtt_connect_callback(struct mosquitto *mosq, void *obj, int result) {
+  options_t *options = (options_t *) obj;
+
+  if (options->debug) {
+    printf("connect callback, rc=%d\n", result);
+  }
 }
 
 int mqtt_publish(options_t *options, char *p_buf, size_t sz_buf)
@@ -181,12 +431,14 @@ void mqtt_message_callback(struct mosquitto *mosq, void *obj, const struct mosqu
   options_t *options = (options_t*)obj;
 
   if ( options->debug) {
-    fprintf(stderr, "Received message (mid=%i, len=%i)\n",
+    fprintf(stderr, "Received message (mid=%i, len=%i, raw=%s)\n",
             message->mid,
-            message->payloadlen
+            message->payloadlen,
+            (char*)message->payload
     );
   }
   // convert to msgpack
+  convert_msgpack_to_json(options, (char*)message->payload, message->payloadlen);
 
 }
 
@@ -325,6 +577,7 @@ static void usage(const char* command) {
     fprintf(stderr, "    -f  Write floats instead of doubles\n");
     fprintf(stderr, "    -b  Convert base64 strings with \"base64:\" prefix to bin\n");
     fprintf(stderr, "    -d  Turn on debug output\n");
+    fprintf(stderr, "    -k  pretty print json output\n");
     fprintf(stderr, "    -B <min>  Try to convert any base64 string of at least <min> bytes to bin\n");
     fprintf(stderr, "    -h  Print this help\n");
 }
@@ -360,11 +613,12 @@ int main(int argc, char** argv) {
     options.mqtt_server_host = OPTIONS_DEFAULT_MQTT_SERVER_HOST;
     options.mqtt_server_port = OPTIONS_DEFAULT_MQTT_SERVER_PORT;
     options.mqtt_topic = OPTIONS_DEFAULT_MQTT_TOPIC;
+    options.pretty = true;
 
     // parse options
     opterr = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "s:t:p:i:o:lfbdB:hv?")) != -1) {
+    while ((opt = getopt(argc, argv, "s:t:p:i:o:lfbdkB:hv?")) != -1) {
         switch (opt) {
             case 's':
                 options.mqtt_server_host = optarg;
@@ -392,6 +646,9 @@ int main(int argc, char** argv) {
                 break;
             case 'd':
                 options.debug = true;
+                break;
+            case 'k':
+                options.pretty = true;
                 break;
             case 'B':
                 parse_min_bytes(&options);

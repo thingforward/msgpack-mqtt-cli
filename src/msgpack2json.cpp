@@ -35,6 +35,8 @@
 #include "rapidjson/prettywriter.h"
 #include "rapidjson/writer.h"
 
+/*
+
 // libb64 doesn't have extern "C" around its C headers
 extern "C" {
 #include "b64/cdecode.h"
@@ -148,7 +150,7 @@ static bool base64_ext(mpack_reader_t* reader, WriterType& writer, int8_t exttyp
 }
 
 template <class WriterType>
-static bool element(mpack_reader_t* reader, WriterType& writer, bool b_base64, bool b_base64_prefix, bool b_debug) {
+bool element(mpack_reader_t* reader, WriterType& writer, bool b_base64, bool b_base64_prefix, bool b_debug) {
     const mpack_tag_t tag = mpack_read_tag(reader);
     if (mpack_reader_error(reader) != mpack_ok)
         return false;
@@ -227,7 +229,7 @@ static bool element(mpack_reader_t* reader, WriterType& writer, bool b_base64, b
 
     return true;
 }
-
+*/
 /*
 template <class WriterType>
 static bool convert_all_elements(mpack_reader_t* reader, WriterType& writer, FileWriteStream& stream, options_t* options) {
